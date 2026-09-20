@@ -82,27 +82,60 @@ python3 tooling/har_login_dump.py <你自己的抓包.har>
 
 ## 2. 安装
 
-两种方式，选一种。
+三种方式，选一种。
 
-### 方式 A：编译 ipk（推荐，可 opkg 管理）
+### 方式 A：下载已编译好的 ipk（最省事）
+
+到 [Releases](https://github.com/KevinXu07/qlit_netauth/releases) 下载最新版本：
+
+| 文件 | 用途 |
+|---|---|
+| `qlit-netauth_*.ipk` | 核心包，必需 |
+| `qlit-app...` 见下 | |
+
+| `luci-app-qlit-netauth_*.ipk` | JS 版界面（OpenWrt 21.02 及以上） |
+| `luci-app-qlit-netauth-lua_*.ipk` | Lua 版界面（19.07 / QWRT 等） |
+| `qlit-netauth-files.tar.gz` | 散装文件，配合 `install.sh` 使用（不想用 opkg 时） |
+
+把 ipk 传到路由器安装（界面包二选一，见第 3 节）：
 
 ```sh
-# 在 OpenWrt SDK 或源码树里
-cp -r qlit-netauth              package/
-cp -r luci-app-qlit-netauth     package/   # 界面二选一，见第 3 节
-cp -r luci-app-qlit-netauth-lua package/   # 界面二选一，见第 3 节
-make package/qlit-netauth/compile V=s
-make package/luci-app-qlit-netauth/compile V=s       # 或 -lua
-# 产物: bin/packages/<arch>/base/qlit-netauth_1.0.0-1_all.ipk
-#       bin/packages/<arch>/luci/luci-app-qlit-netauth*_1.0.0-1_all.ipk
+scp qlit-netauth_*.ipk root@192.168.1.1:/tmp/
+opkg install /tmp/qlit-netauth_1.0.0-1_all.ipk
+opkg install /tmp/luci-app-qlit-netauth-lua_1.0.0-1_all.ipk   # 按你的 LuCI 版本选
 ```
 
-拷到路由器 `opkg install *.ipk` 即可。界面包依赖核心包。
+三个包的 `Architecture` 均为 `all`，任何架构的路由器都可安装
+（已在 aarch64 设备上核对过元数据）。
 
-> `luci-app-qlit-netauth` 的目录名不能改 —— `luci.mk` 是按目录名推导包名的。
-> `-lua` 那个没用 `luci.mk`（原因见第 3 节），所以没这个限制。
+### 方式 B：从源码编译 ipk
 
-### 方式 B：直接 scp
+仓库根目录本身即核心包（`Makefile` + `files/`），两个界面包各自独立成目录：
+
+```sh
+git clone https://github.com/KevinXu07/qlit_netauth
+cd qlit_netauth
+
+# 在 OpenWrt SDK 或源码树里
+mkdir -p <SDK>/package/qlit-netauth
+cp Makefile <SDK>/package/qlit-netauth/
+cp -r files <SDK>/package/qlit-netauth/
+cp -r luci-app-qlit-netauth luci-app-qlit-netauth-lua <SDK>/package/
+
+cd <SDK>
+./scripts/feeds update -a && ./scripts/feeds install -a
+make defconfig
+make package/qlit-netauth/compile V=s
+make package/luci-app-qlit-netauth/compile V=s          # 或 -lua
+```
+
+产物在 `bin/packages/<arch>/`。CI 用的就是这套流程，见
+`.github/workflows/build.yml`。
+
+> `luci-app-qlit-netauth` 的目录名不能改 —— `luci.mk` 按目录名推导包名。
+> `-lua` 那个刻意没有使用 `luci.mk`（原因见第 3 节），故无此限制。
+
+### 方式 C：直接 scp（免 opkg）
 
 ```sh
 sh install.sh root@192.168.1.1            # 核心 + 网页界面（自动选对版本）
@@ -113,7 +146,7 @@ sh install.sh root@192.168.1.1 --no-luci  # 只要命令行
 传文件用的是 `ssh + cat` 而不是 `scp` —— 老固件（19.07 / QWRT）上的 dropbear
 没有 `sftp-server`，新版 `scp` 默认走 SFTP 会直接失败。
 
-### 填账号密码并启动（两种方式都一样）
+### 填账号密码并启动（三种方式都一样）
 
 安装网页界面后，可直接在浏览器中进入 **服务 → QLIT认证** 填写（见下一节）。
 只用命令行则是：

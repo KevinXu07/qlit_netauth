@@ -110,13 +110,18 @@ jobs:
 
           echo
           echo "=== ipk 元数据（架构须为 all，才能在 aarch64 路由器上安装）==="
+          # 注意：OpenWrt 的 ipk 是 gzip 压缩的 tar（内含 debian-binary、
+          # control.tar.gz、data.tar.gz），并非 ar 归档，因此用 tar 读取。
           for f in out/*.ipk; do
+            echo "--- $(basename "$f")"
             d=$(mktemp -d)
-            if ar p "$f" control.tar.gz 2>/dev/null | tar -xz -C "$d" 2>/dev/null; then
-              echo "--- $(basename "$f")"
+            if tar xzf "$f" -C "$d" ./control.tar.gz 2>/dev/null &&
+               tar xzOf "$d/control.tar.gz" ./control > "$d/control" 2>/dev/null; then
               grep -E '^(Package|Version|Architecture|Depends):' "$d/control" | sed 's/^/    /'
+              grep -q '^Architecture: all' "$d/control" ||
+                echo "    !! 架构不是 all，aarch64 路由器将无法安装"
             else
-              echo "--- $(basename "$f")（无法读取 control，跳过核对）"
+              echo "    !! 无法读取 control"
             fi
             rm -rf "$d"
           done
