@@ -89,7 +89,15 @@ jobs:
         run: |
           set -eu
           mkdir -p out
-          find sdk/bin/packages -name '*.ipk' -exec cp -v {} out/ \;
+
+          # 只收集本仓库的三个包。SDK 会把依赖（luci-base、liblua、ucode、rpcd 等）
+          # 一并编译进 bin/packages，若不加筛选，Release 会混入上百个无关文件。
+          find sdk/bin/packages -name '*.ipk' | while IFS= read -r f; do
+            case "$(basename "$f")" in
+              qlit-netauth_*|luci-app-qlit-netauth_*|luci-app-qlit-netauth-lua_*)
+                cp -v "$f" out/ ;;
+            esac
+          done
 
           # 免编译安装包：含 install.sh 与全部文件，供不想用 opkg 的场景
           tar czf out/qlit-netauth-files.tar.gz \
@@ -126,12 +134,15 @@ jobs:
         run: |
           set -eu
           tag="${GITHUB_REF_NAME}"
+
+          # 先删除同名 Release 再重建，以保证附件清单与本次产物完全一致。
+          # 用 upload --clobber 只能覆盖同名附件，上一次构建多出来的文件会残留。
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag 已存在，覆盖上传产物"
-            gh release upload "$tag" out/* --clobber
-          else
-            echo "创建 Release $tag"
-            gh release create "$tag" out/* \
-              --title "QLIT认证 ${tag}" \
-              --generate-notes
+            echo "删除已存在的 Release $tag 后重建"
+            gh release delete "$tag" --yes
           fi
+
+          echo "创建 Release $tag"
+          gh release create "$tag" out/* \
+            --title "QLIT认证 ${tag}" \
+            --generate-notes
