@@ -91,8 +91,6 @@ python3 tooling/har_login_dump.py <你自己的抓包.har>
 | 文件 | 用途 |
 |---|---|
 | `qlit-netauth_*.ipk` | 核心包，必需 |
-| `qlit-app...` 见下 | |
-
 | `luci-app-qlit-netauth_*.ipk` | JS 版界面（OpenWrt 21.02 及以上） |
 | `luci-app-qlit-netauth-lua_*.ipk` | Lua 版界面（19.07 / QWRT 等） |
 | `qlit-netauth-files.tar.gz` | 散装文件，配合 `install.sh` 使用（不想用 opkg 时） |
