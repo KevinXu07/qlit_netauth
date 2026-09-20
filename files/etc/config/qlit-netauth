@@ -1,0 +1,45 @@
+# QLIT认证 — 齐鲁工业大学校园网 Dr.COM 门户自动认证
+#
+# 认证流程依据抓包分析还原（门户 10.2.2.82，Dr.COM）:
+#   登录  POST /ac_portal/login.php
+#         opr=pwdLogin&userName=..&pwd=RC4hex(密码, auth_tag)&auth_tag=..&rememberPwd=0
+#   注销  GET  /homepage/logout
+#
+# 修改本文件后执行:  /etc/init.d/qlit-netauth restart
+
+config qlit-netauth 'settings'
+	# 总开关。请先填写下方账号与密码，再将此项设为 1
+	option enabled '0'
+
+	# 校园网账号与密码。密码以明文填写即可，RC4 加密由本程序在发送前完成
+	option username ''
+	option password ''
+
+	# 认证门户地址。通常无需修改，亦可写作 "http://10.2.2.82"
+	option portal '10.2.2.82'
+
+	# 在线状态探测间隔（秒）
+	option interval '60'
+
+	# 认证失败后的重试间隔（秒）
+	option retry_interval '15'
+
+	# 单次 HTTP 请求超时时间（秒）
+	option timeout '8'
+
+	# 在线探测列表，以空格分隔，每条格式为 URL|MARKER：
+	#     URL|=TEXT   响应体须恰好等于 TEXT
+	#     URL|=       响应体须为空（即 HTTP 204，仅当已安装 curl 时采信）
+	#     URL|TEXT    响应体须包含 TEXT
+	# 任意一条匹配即判定为在线；全部不匹配则发起认证。
+	# 若日志中持续出现反复认证，表明所列探测地址在本网络下均不可达，
+	# 请替换为本网络内可访问的地址。
+	option probe 'http://detectportal.firefox.com/success.txt|=success http://captive.apple.com/hotspot-detect.html|<TITLE>Success</TITLE> http://www.msftconnecttest.com/connecttest.txt|=Microsoft Connect Test'
+
+	# 多 WAN 或策略路由环境下，指定认证流量的出口接口。
+	# 留空表示使用默认路由。注意：仅 curl 支持该选项；使用 uclient-fetch 时
+	# 需先执行 opkg install curl。
+	option bind_interface ''
+
+	# 取值: error | warn | info | debug
+	option log_level 'info'

@@ -1,0 +1,137 @@
+name: build
+
+# 触发条件：
+#   - 推送 tag（v*）  -> 编译并创建 Release，产物附在 Release 上
+#   - 推送到主分支     -> 仅编译并上传为 Actions 产物，便于日常验证
+#   - 手动触发
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+# 创建 Release 需要写权限
+permissions:
+  contents: write
+
+env:
+  # 本仓库的三个包都是 PKGARCH:=all（架构无关），因此任意目标平台的 SDK 均可编译，
+  # 产物可安装在 aarch64 等其它架构的路由器上。这里选用体积最小的 x86/64。
+  SDK_VERSION: '23.05.5'
+  SDK_TARGET: 'x86/64'
+
+jobs:
+  build:
+    name: 编译 ipk
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 缓存 SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: sdk
+          # 文件名含 gcc 版本，会随 SDK 版本变化，故一并作为缓存键的一部分
+          key: sdk-${{ env.SDK_VERSION }}-${{ env.SDK_TARGET }}-v1
+
+      - name: 下载并解压 SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          base="https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${SDK_TARGET}"
+          # 文件名中的 gcc 版本随版本而变，从目录索引中取，避免写死
+          file=$(curl -fsSL "$base/" | grep -oE 'openwrt-sdk-[^"<>]*\.tar\.xz' | sort -u | head -n1)
+          if [ -z "$file" ]; then
+            echo "未能在 $base 找到 SDK 压缩包" >&2
+            exit 1
+          fi
+          echo "使用 SDK: $file"
+          curl -fsSL -o sdk.tar.xz "$base/$file"
+          mkdir -p sdk
+          tar -xJf sdk.tar.xz -C sdk --strip-components=1
+          rm -f sdk.tar.xz
+
+      - name: 把软件包放入 SDK
+        run: |
+          set -eu
+          # 仓库根目录本身即核心包（Makefile + files/），两个界面包各自独立成目录，
+          # 与 README「安装」一节给出的做法一致。
+          mkdir -p sdk/package/qlit-netauth
+          cp Makefile sdk/package/qlit-netauth/
+          cp -r files sdk/package/qlit-netauth/
+          cp -r luci-app-qlit-netauth     sdk/package/
+          cp -r luci-app-qlit-netauth-lua sdk/package/
+          echo "已放入的包："
+          ls -1 sdk/package/ | grep -E 'qlit' | sed 's/^/  /'
+
+      - name: 更新并安装 feeds
+        run: |
+          set -eu
+          cd sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 编译
+        run: |
+          set -eu
+          cd sdk
+          make defconfig
+          for p in qlit-netauth luci-app-qlit-netauth luci-app-qlit-netauth-lua; do
+            echo "=============== 编译 $p ==============="
+            make package/$p/compile V=s
+          done
+
+      - name: 收集产物并核对元数据
+        run: |
+          set -eu
+          mkdir -p out
+          find sdk/bin/packages -name '*.ipk' -exec cp -v {} out/ \;
+
+          # 免编译安装包：含 install.sh 与全部文件，供不想用 opkg 的场景
+          tar czf out/qlit-netauth-files.tar.gz \
+            files install.sh README.md \
+            luci-app-qlit-netauth luci-app-qlit-netauth-lua
+
+          echo
+          echo "=== 产物清单 ==="
+          ls -l out/
+
+          echo
+          echo "=== ipk 元数据（架构须为 all，才能在 aarch64 路由器上安装）==="
+          for f in out/*.ipk; do
+            d=$(mktemp -d)
+            if ar p "$f" control.tar.gz 2>/dev/null | tar -xz -C "$d" 2>/dev/null; then
+              echo "--- $(basename "$f")"
+              grep -E '^(Package|Version|Architecture|Depends):' "$d/control" | sed 's/^/    /'
+            else
+              echo "--- $(basename "$f")（无法读取 control，跳过核对）"
+            fi
+            rm -rf "$d"
+          done
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: qlit-netauth-packages
+          path: out/*
+
+      - name: 发布到 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，覆盖上传产物"
+            gh release upload "$tag" out/* --clobber
+          else
+            echo "创建 Release $tag"
+            gh release create "$tag" out/* \
+              --title "QLIT认证 ${tag}" \
+              --generate-notes
+          fi

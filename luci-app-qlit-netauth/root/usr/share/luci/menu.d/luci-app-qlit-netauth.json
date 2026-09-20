@@ -1,0 +1,18 @@
+{
+  "admin/services/qlit-netauth": {
+    "title": "QLIT认证",
+    "order": 30,
+    "action": {
+      "type": "view",
+      "path": "qlit-netauth/settings"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-qlit-netauth"
+      ],
+      "uci": {
+        "qlit-netauth": true
+      }
+    }
+  }
+}

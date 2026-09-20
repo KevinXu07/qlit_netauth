@@ -1,0 +1,719 @@
+#!/bin/sh
+# =============================================================================
+#  QLIT认证 — 齐鲁工业大学校园网 Dr.COM 门户自动认证
+#
+#  认证流程依据抓包分析还原（门户 10.2.2.82），涉及的接口如下:
+#
+#    登录  POST http://<portal>/ac_portal/login.php
+#            opr=pwdLogin
+#            &userName=<用户名>
+#            &pwd=<RC4_hex(密码, auth_tag)>
+#            &auth_tag=<毫秒时间戳>
+#            &rememberPwd=0
+#
+#    注销  GET  http://<portal>/homepage/logout
+#
+#  加密方式: auth_tag 同时充当毫秒时间戳与 RC4 密钥。门户页面 JS 中为
+#      var rckey = +(new Date()) + '';
+#      do_encrypt_rc4(pwd, rckey)
+#  密钥由客户端生成并随请求一并提交，服务端据此解密 pwd。
+#
+#  运行环境: OpenWrt。不依赖任何第三方软件包 —— RC4 由 busybox awk 实现
+#  （OpenWrt 默认 /usr/bin/awk -> /bin/busybox），HTTP 请求由 busybox 自带的
+#  uclient-fetch 完成；若系统已安装 curl 则优先使用（可获取状态码，探测更精确）。
+#
+#  自检: qlit-netauth selftest  以参考向量校验本机 awk 的 RC4 实现
+#        若要核对本机实现与你自己抓到的门户数据是否一致，用:
+#            qlit-netauth verify <明文密码> <auth_tag> <抓包中的 pwd 密文>
+# =============================================================================
+
+VERSION='1.0.0'
+
+CONFIG_FILE='/etc/config/qlit-netauth'
+LOG_TAG='qlit-netauth'
+# 守护进程将最近一次探测结果缓存于此，供 LuCI 界面读取。
+# 界面若直接调用 status 子命令，需执行网络探测，最长可能阻塞二十余秒。
+STATE_FILE="${QLIT_STATE_FILE:-/var/run/qlit-netauth.state}"
+
+DEFAULT_PROBE='http://detectportal.firefox.com/success.txt|=success http://captive.apple.com/hotspot-detect.html|<TITLE>Success</TITLE> http://www.msftconnecttest.com/connecttest.txt|=Microsoft Connect Test'
+
+# ---- 运行时状态 -------------------------------------------------------------
+HTTP_CLIENT=''          # curl | uclient | wget
+HAVE_UCI=''
+SLEEP_PID=''
+LAST_STATE=''
+
+CFG_USERNAME=''
+CFG_PASSWORD=''
+CFG_PORTAL=''
+CFG_INTERVAL=''
+CFG_RETRY_INTERVAL=''
+CFG_TIMEOUT=''
+CFG_PROBE=''
+CFG_BIND_INTERFACE=''
+CFG_LOG_LEVEL=''
+CFG_LOG_LEVEL_FORCE=''
+
+LOG_LEVEL_NUM=2         # error=0 warn=1 info=2 debug=3
+
+
+# =============================================================================
+#  日志
+# =============================================================================
+log_level_num() {
+	case "$1" in
+		error) echo 0 ;;
+		warn)  echo 1 ;;
+		info)  echo 2 ;;
+		debug) echo 3 ;;
+		*)     echo 2 ;;
+	esac
+}
+
+# syslog 的优先级名与我们的级别名不完全一致（warn -> warning, error -> err）
+syslog_prio() {
+	case "$1" in
+		error) echo err ;;
+		warn)  echo warning ;;
+		*)     echo info ;;
+	esac
+}
+
+log() {
+	_lvl="$1"; shift
+	[ "$(log_level_num "$_lvl")" -le "$LOG_LEVEL_NUM" ] || return 0
+	_msg="$*"
+
+	# 由 procd 启动时（init 脚本注入了 QLIT_UNDER_PROCD）不回显到 stderr：
+	# procd 会把 stderr 一并转进 syslog，且优先级恒为 err，与下面 logger 写入的
+	# 那条重复，并把 info 级消息误标成错误。回显仅供命令行手工执行时观察。
+	[ -n "$QLIT_UNDER_PROCD" ] || echo "[$_lvl] $_msg" >&2
+
+	logger -t "$LOG_TAG" -p "daemon.$(syslog_prio "$_lvl")" "$_msg" 2>/dev/null
+}
+
+# 响应体可能是一整页 HTML，不宜完整写入 syslog
+log_trunc() {
+	printf '%s' "$1" | tr -d '\r\n' | cut -c1-200
+}
+
+
+# =============================================================================
+#  RC4 —— 对应门户 rc4.js 里的 do_encrypt_rc4(src, passwd)
+#
+#  原 JS 把每个密文字节格式化成两位十六进制，所以这里直接输出 hex 串。
+#  XOR 用纯算术实现（逐位拆分），不依赖 gawk 的 xor() 扩展 —— busybox awk
+#  不保证提供位运算函数。
+# =============================================================================
+rc4_hex() {
+	QLIT_SRC="$1" QLIT_KEY="$2" awk '
+		BEGIN {
+			for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i
+			print rc4hex(ENVIRON["QLIT_SRC"], ENVIRON["QLIT_KEY"])
+		}
+		function xor8(a, b,   r, bit) {
+			r = 0
+			for (bit = 1; bit <= 128; bit *= 2)
+				if (int(a / bit) % 2 != int(b / bit) % 2) r += bit
+			return r
+		}
+		function rc4hex(src, passwd,   i, j, a, b, c, t, plen, slen, out, n, sbox, k) {
+			plen = length(passwd)
+			if (plen == 0) return ""
+			slen = length(src)
+			for (i = 0; i < 256; i++) {
+				sbox[i] = i
+				k[i] = ORD[substr(passwd, (i % plen) + 1, 1)]
+			}
+			j = 0
+			for (i = 0; i < 256; i++) {
+				j = (j + sbox[i] + k[i]) % 256
+				t = sbox[i]; sbox[i] = sbox[j]; sbox[j] = t
+			}
+			out = ""
+			a = 0; b = 0
+			for (n = 1; n <= slen; n++) {
+				a = (a + 1) % 256
+				b = (b + sbox[a]) % 256
+				t = sbox[a]; sbox[a] = sbox[b]; sbox[b] = t
+				c = (sbox[a] + sbox[b]) % 256
+				out = out sprintf("%02x", xor8(ORD[substr(src, n, 1)], sbox[c]))
+			}
+			return out
+		}
+	'
+}
+
+# =============================================================================
+#  URL 编码（用户名可能含特殊字符；浏览器端 jQuery 提交时也会做同样编码）
+# =============================================================================
+urlencode() {
+	printf '%s' "$1" | awk '
+		BEGIN { for (i = 1; i < 256; i++) ORD[sprintf("%c", i)] = i }
+		{
+			for (i = 1; i <= length($0); i++) {
+				c = substr($0, i, 1)
+				if (c ~ /[A-Za-z0-9_.~-]/) printf "%s", c
+				else printf "%%%02X", ORD[c]
+			}
+		}
+	'
+}
+
+# =============================================================================
+#  当前毫秒时间戳
+#
+#  busybox date 不一定编译了 %N (FEATURE_DATE_NANO)，所以显式校验结果是否为
+#  13 位数字，不是则退化成「秒 + 000」。服务端只要求它是个合理的时间戳，
+#  秒级精度足够。
+# =============================================================================
+now_ms() {
+	_ms=$(date +%s%3N 2>/dev/null)
+	case "$_ms" in
+		[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+			printf '%s' "$_ms" ;;
+		*)
+			printf '%s000' "$(date +%s)" ;;
+	esac
+}
+
+
+# =============================================================================
+#  配置读取
+#
+#  优先使用 uci 读取；系统无 uci 时（例如在开发机上测试）回退读取纯 shell
+#  格式的配置文件，其中变量名与 UCI 选项同名。
+# =============================================================================
+cfg_opt() {
+	# $1 = 选项名, $2 = 默认值
+	if [ -n "$HAVE_UCI" ]; then
+		_v=$(uci -q get "qlit-netauth.settings.$1" 2>/dev/null)
+	else
+		eval "_v=\"\${$1:-}\""
+	fi
+	[ -n "$_v" ] && printf '%s' "$_v" || printf '%s' "$2"
+}
+
+load_config() {
+	if command -v uci >/dev/null 2>&1 && [ -f "$CONFIG_FILE" ]; then
+		HAVE_UCI=1
+	fi
+
+	CFG_USERNAME=$(cfg_opt username '')
+	CFG_PASSWORD=$(cfg_opt password '')
+	CFG_PORTAL=$(cfg_opt portal '10.2.2.82')
+	CFG_INTERVAL=$(cfg_opt interval '60')
+	CFG_RETRY_INTERVAL=$(cfg_opt retry_interval '15')
+	CFG_TIMEOUT=$(cfg_opt timeout '8')
+	CFG_PROBE=$(cfg_opt probe "$DEFAULT_PROBE")
+	CFG_BIND_INTERFACE=$(cfg_opt bind_interface '')
+	CFG_LOG_LEVEL=$(cfg_opt log_level 'info')
+
+	normalize_config
+}
+
+load_shell_config() {
+	[ -f "$1" ] || { echo "配置文件不存在: $1" >&2; exit 1; }
+	# shellcheck disable=SC1090
+	. "$1"
+	HAVE_UCI=''
+
+	CFG_USERNAME=${username:-}
+	CFG_PASSWORD=${password:-}
+	CFG_PORTAL=${portal:-10.2.2.82}
+	CFG_INTERVAL=${interval:-60}
+	CFG_RETRY_INTERVAL=${retry_interval:-15}
+	CFG_TIMEOUT=${timeout:-8}
+	CFG_PROBE=${probe:-$DEFAULT_PROBE}
+	CFG_BIND_INTERFACE=${bind_interface:-}
+	CFG_LOG_LEVEL=${log_level:-info}
+
+	normalize_config
+}
+
+normalize_config() {
+	# 允许 portal 写成带协议前缀/带结尾斜杠的形式
+	CFG_PORTAL=${CFG_PORTAL#http://}
+	CFG_PORTAL=${CFG_PORTAL#https://}
+	CFG_PORTAL=${CFG_PORTAL%/}
+
+	[ -n "$CFG_LOG_LEVEL_FORCE" ] && CFG_LOG_LEVEL="$CFG_LOG_LEVEL_FORCE"
+	LOG_LEVEL_NUM=$(log_level_num "$CFG_LOG_LEVEL")
+}
+
+
+# =============================================================================
+#  HTTP
+# =============================================================================
+detect_http_client() {
+	if command -v curl >/dev/null 2>&1; then
+		HTTP_CLIENT=curl
+	elif command -v uclient-fetch >/dev/null 2>&1; then
+		HTTP_CLIENT=uclient
+	elif command -v wget >/dev/null 2>&1; then
+		HTTP_CLIENT=wget
+	else
+		log error "未找到可用的 HTTP 客户端，需要 uclient-fetch、wget 或 curl 之一"
+		exit 1
+	fi
+	log debug "HTTP 客户端: $HTTP_CLIENT"
+}
+
+http_client_name() {
+	case "$HTTP_CLIENT" in
+		curl)    echo curl ;;
+		uclient) echo uclient-fetch ;;
+		wget)    echo wget ;;
+		*)       echo "$HTTP_CLIENT" ;;
+	esac
+}
+
+# curl 支持绑定出口接口，其余 HTTP 客户端无对应参数
+bind_args() {
+	[ -n "$CFG_BIND_INTERFACE" ] && printf '%s' "--interface $CFG_BIND_INTERFACE"
+}
+
+http_post() {
+	# $1 = url, $2 = urlencoded body
+	case "$HTTP_CLIENT" in
+		curl)
+			curl -s --max-time "$CFG_TIMEOUT" $(bind_args) -X POST \
+				-H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+				-H 'X-Requested-With: XMLHttpRequest' \
+				--data "$2" "$1" 2>/dev/null
+			;;
+		uclient)
+			uclient-fetch -q -O - --timeout="$CFG_TIMEOUT" --post-data="$2" "$1" 2>/dev/null
+			;;
+		wget)
+			wget -q -O - --timeout="$CFG_TIMEOUT" --post-data="$2" "$1" 2>/dev/null
+			;;
+	esac
+}
+
+http_get_body() {
+	# $1 = url
+	case "$HTTP_CLIENT" in
+		curl)    curl -s -L --max-time "$CFG_TIMEOUT" $(bind_args) "$1" 2>/dev/null ;;
+		uclient) uclient-fetch -q -O - --timeout="$CFG_TIMEOUT" "$1" 2>/dev/null ;;
+		wget)    wget -q -O - --timeout="$CFG_TIMEOUT" "$1" 2>/dev/null ;;
+	esac
+}
+
+http_get_code() {
+	# $1 = url —— 仅 curl 可获取状态码，其余客户端返回空
+	[ "$HTTP_CLIENT" = curl ] || return 1
+	curl -s -o /dev/null -w '%{http_code}' --max-time "$CFG_TIMEOUT" $(bind_args) "$1" 2>/dev/null
+}
+
+
+# =============================================================================
+#  在线探测
+#
+#  各条目以空白分隔，每条形如  URL|MARKER：
+#      "=TEXT"  → 响应体必须恰好等于 TEXT
+#      "="      → 响应体必须为空（即 HTTP 204）。在门户以 302 劫持的场景下
+#                 也可能出现空响应体，故仅当可确认状态码（已安装 curl）时才予
+#                 采信，否则跳过该条目，避免将离线误判为在线。
+#      "TEXT"   → 响应体包含 TEXT
+#  任意一条匹配即判定为在线；全部不匹配则判定为需要认证。
+#
+#  注意 MARKER 中允许含空格（例如 "=Microsoft Connect Test"），因此解析时不能
+#  简单地按空白切分：先按空白切分，再把不以 http:// 或 https:// 开头的片段并回
+#  前一条。探测地址必须带协议头（否则 curl 与 uclient-fetch 均无法使用），
+#  该判据因此是可靠的。
+#
+#  采用响应体特征而非状态码作为判据的原因：uclient-fetch 无法输出状态码；
+#  且未认证时门户会将请求劫持至认证页，返回内容为一段 HTML，既不等于期望的
+#  特征串也不为空，据此判定为离线，结论正确。
+# =============================================================================
+# 匹配单条 URL|MARKER；命中返回 0，未命中或条目非法返回 1。
+probe_one() {
+	_entry="$1"
+
+	# 若条目缺少 | 分隔符，${_entry#*|} 将原样返回整个条目，导致以 URL 作为
+	# 特征串去匹配响应体，结果必然不匹配，表现为持续判定离线并反复认证。
+	# 此处显式拦截该情况。
+	case "$_entry" in
+		*'|'*) ;;
+		*) log warn "probe 条目缺少 '|' 分隔符，已跳过: $_entry"; return 1 ;;
+	esac
+
+	_url=${_entry%%|*}
+	_marker=${_entry#*|}
+	[ -n "$_url" ] || return 1
+
+	case "$_marker" in
+		=)
+			if [ "$HTTP_CLIENT" = curl ]; then
+				[ "$(http_get_code "$_url")" = "204" ] && {
+					log debug "probe 命中 204: $_url"; return 0; }
+			fi
+			;;
+		=*)
+			_want=${_marker#=}
+			_body=$(http_get_body "$_url" | tr -d '\r\n')
+			[ "$_body" = "$_want" ] && { log debug "probe 命中: $_url"; return 0; }
+			;;
+		*)
+			_body=$(http_get_body "$_url")
+			case "$_body" in
+				*"$_marker"*) log debug "probe 命中: $_url"; return 0 ;;
+			esac
+			;;
+	esac
+	return 1
+}
+
+probe_online() {
+	_cur=''
+	for _tok in $CFG_PROBE; do
+		case "$_tok" in
+			http://*|https://*)
+				if [ -n "$_cur" ]; then
+					probe_one "$_cur" && return 0
+				fi
+				_cur=$_tok
+				;;
+			*)
+				# 不是新条目的开头，说明是上一条 MARKER 中带空格的片段
+				[ -n "$_cur" ] && _cur="$_cur $_tok"
+				;;
+		esac
+	done
+	if [ -n "$_cur" ]; then
+		probe_one "$_cur" && return 0
+	fi
+	return 1
+}
+
+
+# =============================================================================
+#  登录 / 注销
+# =============================================================================
+portal_url() {
+	printf 'http://%s%s' "$CFG_PORTAL" "$1"
+}
+
+# 门户返回的是以单引号包裹的非标准 JSON（非合法 JSON），以 sed 提取字段
+resp_field() {
+	printf '%s' "$1" | sed -n "s/.*'$2'[[:space:]]*:[[:space:]]*'\{0,1\}\([^',}]*\)'\{0,1\}.*/\1/p"
+}
+
+resp_success() {
+	printf '%s' "$1" | grep -q "'success'[[:space:]]*:[[:space:]]*true"
+}
+
+# 登录前先确认本机 awk 计算的 RC4 结果与抓包向量一致。
+# 若 awk 缺失或行为异常，则拒绝登录：以错误的密码反复尝试既无法通过认证，
+# 又可能触发服务端的账号锁定策略。
+CRYPTO_OK=''
+verify_crypto() {
+	[ -n "$CRYPTO_OK" ] && return 0
+	_got=$(rc4_hex 'example-password' '1700000000000')
+	if [ "$_got" != '6dd4f823a554faf3c5e62d27b5983c91' ]; then
+		log error "RC4 自检未通过（期望 6dd4f823a554faf3c5e62d27b5983c91，实际 '${_got:-<空>}'），已拒绝登录。请执行 qlit-netauth selftest 检查 awk 是否可用。"
+		return 1
+	fi
+	CRYPTO_OK=1
+	return 0
+}
+
+do_login() {
+	[ -n "$CFG_USERNAME" ] || { log error "未配置用户名"; return 1; }
+	[ -n "$CFG_PASSWORD" ] || { log error "未配置密码"; return 1; }
+
+	verify_crypto || return 1
+
+	_tag=$(now_ms)
+	_enc=$(rc4_hex "$CFG_PASSWORD" "$_tag")
+	if [ -z "$_enc" ]; then
+		log error "RC4 加密失败，请执行 qlit-netauth selftest 检查 awk 是否可用"
+		return 1
+	fi
+
+	_body="opr=pwdLogin&userName=$(urlencode "$CFG_USERNAME")&pwd=$_enc&auth_tag=$_tag&rememberPwd=0"
+	_resp=$(http_post "$(portal_url /ac_portal/login.php)" "$_body")
+
+	if [ -z "$_resp" ]; then
+		log warn "登录请求无响应，门户 $CFG_PORTAL 可能不可达"
+		return 1
+	fi
+
+	if resp_success "$_resp"; then
+		log info "认证成功: 用户 $CFG_USERNAME"
+		return 0
+	fi
+
+	_msg=$(resp_field "$_resp" msg)
+	case "$_msg" in
+		*已在线*|*already*|*Already*|*重复*)
+			log info "服务端报告已在线: $_msg"
+			return 0
+			;;
+	esac
+
+	log warn "认证失败: $(log_trunc "${_msg:-$_resp}")"
+	return 1
+}
+
+do_logout() {
+	_resp=$(http_get_body "$(portal_url /homepage/logout)")
+	if [ -z "$_resp" ]; then
+		log warn "注销请求无响应"
+		return 1
+	fi
+	if resp_success "$_resp"; then
+		log info "注销成功"
+		return 0
+	fi
+	log warn "注销失败: $(log_trunc "$(resp_field "$_resp" msg)")"
+	return 1
+}
+
+
+# =============================================================================
+#  子命令
+# =============================================================================
+cmd_status() {
+	if probe_online; then
+		echo "online"
+		return 0
+	fi
+	echo "offline"
+	return 1
+}
+
+cmd_check() {
+	if probe_online; then
+		[ "$LAST_STATE" = online ] || log info "网络在线"
+		LAST_STATE=online
+		write_state online
+		return 0
+	fi
+	log debug "检测到未认证，开始登录 ..."
+	if do_login; then
+		LAST_STATE=online
+		write_state online
+		return 0
+	fi
+	LAST_STATE=offline
+	write_state offline
+	return 1
+}
+
+# 记录最近一次探测结果，格式: "<online|offline> <unix时间戳>"
+write_state() {
+	_dir=$(dirname "$STATE_FILE")
+	[ -d "$_dir" ] || mkdir -p "$_dir" 2>/dev/null
+	printf '%s %s\n' "$1" "$(date +%s)" > "$STATE_FILE" 2>/dev/null
+	return 0
+}
+
+read_state() {
+	# 只读缓存，不发任何网络请求
+	if [ -r "$STATE_FILE" ]; then
+		cat "$STATE_FILE"
+	else
+		echo "unknown 0"
+	fi
+}
+
+interruptible_sleep() {
+	# 使 procd 的 stop (SIGTERM) 无需等待完整的 interval
+	sleep "$1" &
+	SLEEP_PID=$!
+	wait "$SLEEP_PID" 2>/dev/null
+	SLEEP_PID=''
+	# wait 被信号打断时返回非 0，此时由 trap 处理退出
+}
+
+cmd_daemon() {
+	trap 'interruptible_cleanup; exit 0' TERM INT
+	LAST_STATE=''
+
+	if [ -n "$CFG_BIND_INTERFACE" ] && [ "$HTTP_CLIENT" != curl ]; then
+		log warn "已配置 bind_interface，但当前 HTTP 客户端为 ${HTTP_CLIENT}，该选项不生效；如需使用请先安装 curl"
+	fi
+
+	write_state unknown
+	log info "启动: portal=$CFG_PORTAL user=$CFG_USERNAME 探测间隔=${CFG_INTERVAL}s"
+
+	while :; do
+		if cmd_check; then
+			interruptible_sleep "$CFG_INTERVAL"
+		else
+			interruptible_sleep "$CFG_RETRY_INTERVAL"
+		fi
+	done
+}
+
+interruptible_cleanup() {
+	[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+	return 0
+}
+
+cmd_state() {
+	read_state
+}
+
+# 以调用者提供的向量校验本机 RC4 实现，用于核对与本门户抓包数据是否一致。
+# 向量取自门户登录请求：auth_tag 即密钥，pwd 即密文（见 README 第 1 节）。
+cmd_verify() {
+	_pw=${1:-}
+	_key=${2:-}
+	_want=${3:-}
+
+	if [ -z "$_pw" ] || [ -z "$_key" ] || [ -z "$_want" ]; then
+		echo "用法: qlit-netauth verify <明文密码> <auth_tag> <抓包中的 pwd 密文>" >&2
+		echo "示例: qlit-netauth verify example-password 1700000000000 6dd4f823a554faf3c5e62d27b5983c91" >&2
+		return 2
+	fi
+
+	_got=$(rc4_hex "$_pw" "$_key")
+	if [ "$_got" = "$_want" ]; then
+		echo "ok   本机 RC4 实现与所提供的向量一致"
+		echo "     auth_tag=$_key  ->  $_got"
+		return 0
+	fi
+
+	echo "FAIL 本机 RC4 结果与所提供的向量不一致"
+	echo "     auth_tag : $_key"
+	echo "     期望密文 : $_want"
+	echo "     实际密文 : ${_got:-<空>}"
+	return 1
+}
+
+cmd_selftest() {
+	_rc=0
+
+	# 1. RC4：与参考向量比对
+	#    example-password + 1700000000000 -> 6dd4f823a554faf3c5e62d27b5983c91
+	# 该向量由本实现与一份独立实现交叉核对得到（详见 README）。
+	# 若要核对与你自己抓包的数据是否一致，用 verify 子命令。
+	_got=$(rc4_hex 'example-password' '1700000000000')
+	if [ "$_got" = '6dd4f823a554faf3c5e62d27b5983c91' ]; then
+		echo "ok   RC4 与参考向量一致 (example-password + 1700000000000 -> $_got)"
+	else
+		echo "FAIL RC4 结果不符: 期望 6dd4f823a554faf3c5e62d27b5983c91 实际 '$_got'"
+		_rc=1
+	fi
+
+	_ts=$(now_ms)
+	case "$_ts" in
+		[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+			echo "ok   毫秒时间戳: $_ts" ;;
+		*)
+			echo "FAIL 毫秒时间戳格式异常: '$_ts'"; _rc=1 ;;
+	esac
+
+	_ue=$(urlencode 'a b&c=d+1')
+	if [ "$_ue" = 'a%20b%26c%3Dd%2B1' ]; then
+		echo "ok   URL 编码: $_ue"
+	else
+		echo "FAIL URL 编码: 期望 a%20b%26c%3Dd%2B1 实际 '$_ue'"
+		_rc=1
+	fi
+
+	echo "ok   HTTP 客户端: $(http_client_name)"
+
+	if [ -n "$CFG_USERNAME" ]; then
+		echo "ok   配置: user=$CFG_USERNAME portal=$CFG_PORTAL probe 条目数=$(printf '%s\n' $CFG_PROBE | grep -cE '^https?://')"
+	else
+		echo "warn 未配置用户名，请编辑 /etc/config/qlit-netauth"
+	fi
+
+	if [ "$HTTP_CLIENT" = curl ]; then
+		_code=$(http_get_code "$(portal_url /ac_portal/login.php)")
+		if [ -n "$_code" ]; then
+			echo "ok   门户可达: $(portal_url /ac_portal/login.php) HTTP $_code"
+		else
+			echo "warn 门户不可达: $(portal_url /ac_portal/login.php)"
+		fi
+	fi
+
+	if probe_online; then
+		echo "ok   当前网络状态: 在线"
+	else
+		echo "warn 当前网络状态: 离线，或全部探测地址均不可达，请检查 probe 配置"
+	fi
+
+	return $_rc
+}
+
+usage() {
+	cat <<EOF
+QLIT认证 (qlit-netauth) $VERSION — 齐鲁工业大学校园网 Dr.COM 门户自动认证
+
+用法: qlit-netauth <命令> [选项]
+
+命令:
+  check       探测在线状态，未认证时执行登录（默认动作）
+  login       强制执行一次认证
+  logout      注销下线
+  status      输出 online 或 offline（执行一次真实的网络探测）
+  state       输出守护进程缓存的状态，不产生网络请求（供界面读取）
+  daemon      常驻循环（由 procd 调用，通常无需手动执行）
+  selftest    本机自检：以参考向量校验 RC4、时间戳与 URL 编码
+  verify P K C
+              以指定向量校验本机 RC4 实现：明文密码 P、auth_tag K、
+              抓包中的 pwd 密文 C。用于核对本实现与你自己的抓包是否一致
+  rc4 TEXT    调试用：输出 TEXT 以当前时间戳加密后的结果
+  version     输出版本号
+  help        输出本帮助
+
+选项:
+  -c FILE     使用指定的配置文件（默认 ${CONFIG_FILE}）
+  -v          输出详细日志（等同于 log_level=debug）
+EOF
+}
+
+
+# =============================================================================
+#  入口
+# =============================================================================
+main() {
+	_cmd=''
+	TEST_CONFIG=''
+
+	# 选项须写在命令之前；遇到第一个非选项参数即停止解析，其后全部作为
+	# 该命令的参数（verify 需要三个参数）。
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-c) shift; TEST_CONFIG="${1:-}" ;;
+			-v) CFG_LOG_LEVEL_FORCE=debug ;;
+			-h|--help) usage; exit 0 ;;
+			-*) echo "未知选项: $1" >&2; usage >&2; exit 2 ;;
+			*) break ;;
+		esac
+		shift
+	done
+
+	if [ $# -gt 0 ]; then _cmd="$1"; shift; fi
+	[ -n "$_cmd" ] || _cmd='check'
+
+	if [ -n "$TEST_CONFIG" ]; then
+		load_shell_config "$TEST_CONFIG"
+	else
+		load_config
+	fi
+
+	detect_http_client
+
+	case "$_cmd" in
+		check)    cmd_check ;;
+		login)    do_login ;;
+		logout)   do_logout ;;
+		status)   cmd_status ;;
+		state)    cmd_state ;;
+		daemon)   cmd_daemon ;;
+		selftest) cmd_selftest ;;
+		verify)   cmd_verify "$@" ;;
+		rc4)      rc4_hex "${1:-}" "$(now_ms)"; echo ;;
+		version)  echo "$VERSION" ;;
+		help)     usage ;;
+		*)        echo "未知命令: $_cmd" >&2; usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

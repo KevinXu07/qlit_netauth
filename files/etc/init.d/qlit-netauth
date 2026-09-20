@@ -1,0 +1,53 @@
+#!/bin/sh /etc/rc.common
+# QLIT认证 —— procd 服务脚本
+#
+# 常驻运行 qlit-netauth daemon，掉线后自动重新认证。
+
+START=99
+STOP=10
+USE_PROCD=1
+
+PROG='/usr/bin/qlit-netauth'
+
+start_service() {
+	config_load qlit-netauth
+	config_get_bool enabled settings enabled 0
+
+	if [ "$enabled" -ne 1 ]; then
+		logger -t qlit-netauth "未启用；请在 /etc/config/qlit-netauth 中将 enabled 设为 1"
+		return 0
+	fi
+
+	config_get username settings username ''
+	config_get password settings password ''
+	if [ -z "$username" ] || [ -z "$password" ]; then
+		logger -t qlit-netauth "缺少 username 或 password，服务未启动"
+		return 0
+	fi
+
+	procd_open_instance
+	procd_set_param command "$PROG" daemon
+	# 告知程序不要回显到 stderr：procd 会把 stderr 转入 syslog 且优先级恒为 err，
+	# 会与程序自身经 logger 写入的记录重复。详见主脚本 log() 的说明。
+	procd_set_param env QLIT_UNDER_PROCD=1
+	# 进程异常退出时自动重启：<阈值秒> <重启前等待秒> <重试次数>
+	# 保留 stderr 捕获，以便程序因 shell 层错误异常退出时仍能在 syslog 中看到
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	logger -t qlit-netauth "服务已停止"
+}
+
+reload_service() {
+	# 配置变更后整体重启，使新参数立即生效
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger qlit-netauth
+}

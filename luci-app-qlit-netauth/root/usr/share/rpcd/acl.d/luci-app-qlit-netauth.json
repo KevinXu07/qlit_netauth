@@ -1,0 +1,14 @@
+{
+	"luci-app-qlit-netauth": {
+		"description": "Grant access to QLIT campus network auto authentication",
+		"read": {
+			"uci": [ "qlit-netauth" ],
+			"file": {
+				"/usr/bin/qlit-netauth": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "qlit-netauth" ]
+		}
+	}
+}
