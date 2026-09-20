@@ -1,5 +1,5 @@
 #
-# QLIT认证 — 齐鲁工业大学校园网 Dr.COM 门户自动认证
+# QLIT认证 — 齐鲁理工学院校园网 Dr.COM 门户自动认证
 #
 # 纯脚本包，无需编译。在 OpenWrt SDK 或源码树中：
 #
@@ -31,7 +31,7 @@ define Package/qlit-netauth
 endef
 
 define Package/qlit-netauth/description
-  齐鲁工业大学校园网 Dr.COM 门户自动认证。
+  齐鲁理工学院校园网 Dr.COM 门户自动认证。
 
   由路由器完成 Portal 认证，认证后其下所有设备无需单独登录。
   守护进程按可配置的间隔探测在线状态，掉线后自动重新认证。

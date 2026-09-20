@@ -1,4 +1,4 @@
-# QLIT认证 — 齐鲁工业大学校园网 Dr.COM 门户自动认证
+# QLIT认证 — 齐鲁理工学院校园网 Dr.COM 门户自动认证
 #
 # 认证流程依据抓包分析还原（门户 10.2.2.82，Dr.COM）:
 #   登录  POST /ac_portal/login.php

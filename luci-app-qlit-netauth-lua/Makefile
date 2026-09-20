@@ -32,7 +32,7 @@ define Package/luci-app-qlit-netauth-lua
 endef
 
 define Package/luci-app-qlit-netauth-lua/description
-  齐鲁工业大学校园网 Dr.COM 门户自动认证的 LuCI 配置界面。
+  齐鲁理工学院校园网 Dr.COM 门户自动认证的 LuCI 配置界面。
 
   适用于 19.07 系的 Lua 版 LuCI。提供状态显示、立即认证 / 注销 / 自检
   三个操作按钮，以及账号与高级参数的图形化配置。
